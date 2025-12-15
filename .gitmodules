@@ -1,0 +1,6 @@
+[submodule "thirdparty/pipline-tester-py"]
+	path = thirdparty/pipline-tester-py
+	url = https://github.com/ceerRep/pipeline-tester-py.git
+[submodule "thirdparty/mips-asm-test"]
+	path = thirdparty/mips-asm-test
+	url = https://github.com/ceerRep/mips-asm-test.git
