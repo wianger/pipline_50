@@ -107,6 +107,7 @@ module PipelineCPU(
     );
 
     // Register file
+    reg_addr_t rf_raddr1, rf_raddr2;
     word_t rf_rs_data, rf_rt_data;
     word_t rf_v0_value, rf_a0_value;
 
@@ -115,15 +116,22 @@ module PipelineCPU(
     reg_addr_t wb_waddr;
     word_t     wb_wdata;
 
+    // During an EX-stage MDU stall we temporarily repurpose the 2 RF read ports
+    // to read the stalled instruction's rs/rt, so we can refresh operands even
+    // after older instructions have already written back and left MEM/WB.
+    // This fixes operand-staleness bugs for queued MDU ops (multi-cycle waits).
+    assign rf_raddr1 = stall_idex ? id_ex_q.rs : id_rs;
+    assign rf_raddr2 = stall_idex ? id_ex_q.rt : id_rt;
+
     RegisterFile u_rf (
         .clock    (clock),
         .reset    (reset),
         .we       (wb_we),
         .waddr    (wb_waddr),
         .wdata    (wb_wdata),
-        .raddr1   (id_rs),
+        .raddr1   (rf_raddr1),
         .rdata1   (rf_rs_data),
-        .raddr2   (id_rt),
+        .raddr2   (rf_raddr2),
         .rdata2   (rf_rt_data),
         .v0_value (rf_v0_value),
         .a0_value (rf_a0_value)
@@ -367,26 +375,68 @@ module PipelineCPU(
     // -------------------------------------------------------------------------
 
     word_t ex_rs_val, ex_rt_val;
+    word_t ex_rs_base, ex_rt_base;
+    word_t ex_rs_hold, ex_rt_hold;
+    logic  ex_hold_valid;
     word_t ex_alu_b;
     word_t ex_alu_y;
     word_t ex_result_value;
 
+    // Track when an MDU instruction is stalled in EX (MDU busy).
+    // - While stalled, base operands come from RF live reads (rf_rs_data/rt_data)
+    // - When stall is released (busy -> 0), use the held operands for 1 cycle,
+    //   because RF ports must immediately return to ID stage for branch/jump.
+    wire ex_mdu_stall = stall_idex;
+    wire ex_use_hold  = (!ex_mdu_stall) && ex_hold_valid;
+
     always_comb begin
-        ex_rs_val = id_ex_q.rs_val;
+        // Base operands
+        if (ex_mdu_stall) begin
+            ex_rs_base = rf_rs_data;
+            ex_rt_base = rf_rt_data;
+        end else if (ex_use_hold) begin
+            ex_rs_base = ex_rs_hold;
+            ex_rt_base = ex_rt_hold;
+        end else begin
+            ex_rs_base = id_ex_q.rs_val;
+            ex_rt_base = id_ex_q.rt_val;
+        end
+
+        // Apply forwarding on top of base
+        ex_rs_val = ex_rs_base;
         unique case (fwd_ex_rs_sel)
-            2'b00: ex_rs_val = id_ex_q.rs_val;
+            2'b00: ex_rs_val = ex_rs_base;
             2'b01: ex_rs_val = mem_fwd_value;
             2'b10: ex_rs_val = wb_fwd_value;
-            default: ex_rs_val = id_ex_q.rs_val;
+            default: ex_rs_val = ex_rs_base;
         endcase
 
-        ex_rt_val = id_ex_q.rt_val;
+        ex_rt_val = ex_rt_base;
         unique case (fwd_ex_rt_sel)
-            2'b00: ex_rt_val = id_ex_q.rt_val;
+            2'b00: ex_rt_val = ex_rt_base;
             2'b01: ex_rt_val = mem_fwd_value;
             2'b10: ex_rt_val = wb_fwd_value;
-            default: ex_rt_val = id_ex_q.rt_val;
+            default: ex_rt_val = ex_rt_base;
         endcase
+    end
+
+    // Hold the resolved operands while stalling in EX, and keep the hold valid
+    // for exactly 1 cycle after stall is released.
+    always_ff @(posedge clock) begin
+        if (reset) begin
+            ex_rs_hold   <= 32'h0000_0000;
+            ex_rt_hold   <= 32'h0000_0000;
+            ex_hold_valid <= 1'b0;
+        end else begin
+            if (ex_mdu_stall) begin
+                // Capture the latest resolved operands (includes MEM/WB forwarding)
+                ex_rs_hold <= ex_rs_val;
+                ex_rt_hold <= ex_rt_val;
+                ex_hold_valid <= 1'b1;
+            end else begin
+                ex_hold_valid <= 1'b0;
+            end
+        end
     end
 
     assign ex_alu_b = id_ex_q.alu_src_imm ? id_ex_q.imm_ext : ex_rt_val;
